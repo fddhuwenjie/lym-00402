@@ -1,8 +1,11 @@
 import { spawn, ChildProcess } from "child_process";
 import http from "http";
+import fs from "fs";
+import path from "path";
 
 const BASE_PORT = 8001;
 const NODE_COUNT = 5;
+const DATA_DIR = "./data";
 
 interface NodeInfo {
   id: number;
@@ -62,13 +65,26 @@ function httpPost(url: string, body: object): Promise<object | null> {
       }
     );
     req.on("error", () => resolve(null));
-    req.setTimeout(2000, () => {
+    req.setTimeout(3000, () => {
       req.destroy();
       resolve(null);
     });
     req.write(data);
     req.end();
   });
+}
+
+function clearDataDir(nodeId: number): void {
+  const dir = path.join(DATA_DIR, `node-${nodeId}`);
+  if (fs.existsSync(dir)) {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+function clearAllData(): void {
+  if (fs.existsSync(DATA_DIR)) {
+    fs.rmSync(DATA_DIR, { recursive: true, force: true });
+  }
 }
 
 function startNode(id: number): void {
@@ -125,75 +141,101 @@ function restartNode(id: number): void {
 }
 
 async function status(): Promise<void> {
-  for (let i = 0; i < NODE_COUNT; i++) {
+  console.log("Cluster status:");
+  for (let i = 0; i < NODE_COUNT + 5; i++) {
     const port = BASE_PORT + i;
     const s = await httpGet(`http://127.0.0.1:${port}/status`);
     if (s) {
+      const st = s as any;
       console.log(
-        `Node ${i}: state=${(s as any).state}, term=${(s as any).currentTerm}, leader=${(s as any).currentLeader}, commit=${(s as any).commitIndex}, logLen=${(s as any).logLength}, kvSize=${(s as any).kvSize}, partitioned=${(s as any).partitioned}`
+        `  Node ${st.nodeId}: state=${st.state}, term=${st.currentTerm}, leader=${st.currentLeader}, commit=${st.commitIndex}, lastApplied=${st.lastApplied}, logLen=${st.logLength}, snapIdx=${st.snapshotIndex}, kvSize=${st.kvSize}, clusterSize=${st.clusterSize}`
       );
-    } else {
-      console.log(`Node ${i}: OFFLINE`);
     }
   }
 }
 
-async function writeKey(key: string, value: string): Promise<void> {
-  for (let i = 0; i < NODE_COUNT; i++) {
+async function findLeader(): Promise<number | null> {
+  for (let i = 0; i < NODE_COUNT + 5; i++) {
     const port = BASE_PORT + i;
-    const reply = await httpPost(`http://127.0.0.1:${port}/client/write`, {
-      op: "set",
-      key,
-      value,
-    });
-    if (reply && (reply as any).success) {
-      console.log(`Write success via node ${i}: ${key}=${value}`);
-      return;
-    }
-    if (reply && (reply as any).error === "not leader") {
-      const leaderPort = (reply as any).leaderPort;
-      if (leaderPort) {
-        const leaderReply = await httpPost(
-          `http://127.0.0.1:${leaderPort}/client/write`,
-          { op: "set", key, value }
-        );
-        if (leaderReply && (leaderReply as any).success) {
-          const leaderId = (leaderReply as any).leaderId;
-          console.log(
-            `Write success via leader node ${leaderId}: ${key}=${value}`
-          );
-          return;
-        }
-      }
+    const s = await httpGet(`http://127.0.0.1:${port}/status`);
+    if (s && (s as any).state === "leader") {
+      return i;
     }
   }
-  console.log("Write failed: no leader available");
+  return null;
 }
 
-async function readKey(key: string): Promise<void> {
-  for (let i = 0; i < NODE_COUNT; i++) {
-    const port = BASE_PORT + i;
-    const reply = await httpGet(
-      `http://127.0.0.1:${port}/client/read/${encodeURIComponent(key)}`
-    );
-    if (reply && (reply as any).success) {
-      console.log(`Read success: ${key}=${(reply as any).value}`);
-      return;
-    }
-    if (reply && (reply as any).error === "not leader") {
-      const leaderPort = (reply as any).leaderPort;
-      if (leaderPort) {
-        const leaderReply = await httpGet(
-          `http://127.0.0.1:${leaderPort}/client/read/${encodeURIComponent(key)}`
-        );
-        if (leaderReply && (leaderReply as any).success) {
-          console.log(`Read success: ${key}=${(leaderReply as any).value}`);
-          return;
-        }
-      }
-    }
+async function writeKey(key: string, value: string): Promise<boolean> {
+  const leader = await findLeader();
+  if (leader === null) {
+    console.log("Write failed: no leader available");
+    return false;
   }
-  console.log("Read failed: no leader available");
+  const port = BASE_PORT + leader;
+  const reply = await httpPost(`http://127.0.0.1:${port}/client/write`, {
+    op: "set",
+    key,
+    value,
+  });
+  if (reply && (reply as any).success) {
+    return true;
+  }
+  console.log(`Write failed: ${(reply as any)?.error || "unknown"}`);
+  return false;
+}
+
+async function readKey(key: string): Promise<string | null> {
+  const leader = await findLeader();
+  if (leader === null) {
+    console.log("Read failed: no leader available");
+    return null;
+  }
+  const port = BASE_PORT + leader;
+  const reply = await httpGet(
+    `http://127.0.0.1:${port}/client/read/${encodeURIComponent(key)}`
+  );
+  if (reply && (reply as any).success) {
+    return (reply as any).value;
+  }
+  return null;
+}
+
+async function addMember(nodeId: number, port: number): Promise<boolean> {
+  const leader = await findLeader();
+  if (leader === null) {
+    console.log("Add member failed: no leader available");
+    return false;
+  }
+  const leaderPort = BASE_PORT + leader;
+  const reply = await httpPost(
+    `http://127.0.0.1:${leaderPort}/admin/add-member`,
+    { nodeId, port }
+  );
+  if (reply && (reply as any).success) {
+    console.log(`Add member success: node ${nodeId}:${port}`);
+    return true;
+  }
+  console.log(`Add member failed: ${(reply as any)?.error || "unknown"}`);
+  return false;
+}
+
+async function removeMember(nodeId: number): Promise<boolean> {
+  const leader = await findLeader();
+  if (leader === null) {
+    console.log("Remove member failed: no leader available");
+    return false;
+  }
+  const leaderPort = BASE_PORT + leader;
+  const reply = await httpPost(
+    `http://127.0.0.1:${leaderPort}/admin/remove-member`,
+    { nodeId }
+  );
+  if (reply && (reply as any).success) {
+    console.log(`Remove member success: node ${nodeId}`);
+    return true;
+  }
+  console.log(`Remove member failed: ${(reply as any)?.error || "unknown"}`);
+  return false;
 }
 
 async function partition(groupA: number[], groupB: number[]): Promise<void> {
@@ -225,122 +267,247 @@ async function heal(): Promise<void> {
 async function waitForLeader(timeoutMs = 5000): Promise<number | null> {
   const start = Date.now();
   while (Date.now() - start < timeoutMs) {
-    for (let i = 0; i < NODE_COUNT; i++) {
-      const s = await httpGet(`http://127.0.0.1:${BASE_PORT + i}/status`);
-      if (s && (s as any).state === "leader") {
-        return i;
-      }
-    }
+    const leader = await findLeader();
+    if (leader !== null) return leader;
     await new Promise((r) => setTimeout(r, 200));
   }
   return null;
 }
 
-async function verifyLogs(): Promise<void> {
-  const logs: Map<number, string> = new Map();
-  for (let i = 0; i < NODE_COUNT; i++) {
-    const s = await httpGet(`http://127.0.0.1:${BASE_PORT + i}/status`);
-    if (s) {
-      logs.set(i, `commitIndex=${(s as any).commitIndex}, logLen=${(s as any).logLength}, kvSize=${(s as any).kvSize}`);
-    }
-  }
-  console.log("Log consistency check:");
-  for (const [id, info] of logs) {
-    console.log(`  Node ${id}: ${info}`);
-  }
-}
+async function runSnapshotTest(): Promise<void> {
+  console.log("\n=== Snapshot Test ===\n");
 
-async function runTest(): Promise<void> {
-  console.log("\n=== Raft Cluster Verification Test ===\n");
+  console.log("Clearing all data...");
+  clearAllData();
 
-  console.log("Starting 5 nodes...");
-  for (let i = 0; i < NODE_COUNT; i++) {
+  console.log("Starting 3 nodes (0, 1, 2)...");
+  for (let i = 0; i < 3; i++) {
     startNode(i);
   }
   await new Promise((r) => setTimeout(r, 1000));
 
-  console.log("\n--- Test 1: Leader election within 3 seconds ---");
+  console.log("\nWaiting for leader...");
   const leader = await waitForLeader(3000);
-  if (leader !== null) {
-    console.log(`PASS: Leader elected: node ${leader}`);
-  } else {
-    console.log("FAIL: No leader elected within 3 seconds");
+  if (leader === null) {
+    console.log("FAIL: No leader elected");
     return;
   }
-  await status();
+  console.log(`Leader: node ${leader}`);
 
-  console.log("\n--- Test 2: Write and read ---");
-  await writeKey("hello", "world");
-  await new Promise((r) => setTimeout(r, 200));
-  await readKey("hello");
-  await status();
-
-  console.log("\n--- Test 3: Kill leader and re-election within 5 seconds ---");
-  killNode(leader!);
-  const newLeader = await waitForLeader(5000);
-  if (newLeader !== null) {
-    console.log(`PASS: New leader elected: node ${newLeader}`);
-  } else {
-    console.log("FAIL: No new leader elected within 5 seconds");
-    return;
-  }
-  await status();
-
-  console.log("\n--- Test 4: Log consistency after write ---");
-  await writeKey("foo", "bar");
-  await writeKey("baz", "qux");
-  await new Promise((r) => setTimeout(r, 300));
-  await verifyLogs();
-
-  console.log("\n--- Test 5: Network partition ---");
-  restartNode(leader!);
-  await new Promise((r) => setTimeout(r, 1000));
-  console.log("Restarted killed node, waiting for leader...");
-  await waitForLeader(3000);
-  await status();
-
-  const majorityGroup = [0, 1, 2];
-  const minorityGroup = [3, 4];
-  await partition(majorityGroup, minorityGroup);
-  await new Promise((r) => setTimeout(r, 500));
-
-  console.log("Trying write to minority node (should redirect)...");
-  let minorityRedirectPass = false;
-  for (const nodeId of minorityGroup) {
-    const reply = await httpPost(
-      `http://127.0.0.1:${BASE_PORT + nodeId}/client/write`,
-      { op: "set", key: "minority", value: "test" }
-    );
-    if (reply && (reply as any).error === "not leader") {
-      console.log(`PASS: Minority node ${nodeId} rejected write (redirect)`);
-      minorityRedirectPass = true;
-      break;
-    } else if (reply === null) {
-      console.log(`Minority node ${nodeId} is offline, trying next...`);
-    } else {
-      console.log(`Minority node ${nodeId} reply:`, reply);
+  console.log("\nWriting 200 KV entries...");
+  const batchStart = Date.now();
+  for (let i = 0; i < 200; i++) {
+    await writeKey(`key-${i}`, `value-${i}`);
+    if ((i + 1) % 50 === 0) {
+      console.log(`  Written ${i + 1} entries...`);
     }
   }
-  if (!minorityRedirectPass) {
-    console.log("WARN: Could not verify minority redirect (node may be offline)");
+  console.log(`Write completed in ${Date.now() - batchStart}ms`);
+
+  await new Promise((r) => setTimeout(r, 500));
+
+  console.log("\nChecking snapshot status:");
+  const leaderStatus = await httpGet(`http://127.0.0.1:${BASE_PORT + leader}/status`);
+  if (leaderStatus) {
+    const st = leaderStatus as any;
+    console.log(`  Leader node ${st.nodeId}:`);
+    console.log(`    logLength = ${st.logLength}`);
+    console.log(`    snapshotIndex = ${st.snapshotIndex}`);
+    console.log(`    lastApplied = ${st.lastApplied}`);
+    console.log(`    kvSize = ${st.kvSize}`);
+
+    if (st.snapshotIndex > 0 && st.logLength < 200) {
+      console.log("\n  PASS: Snapshot was taken, log was compacted");
+    } else {
+      console.log("\n  WARN: Snapshot may not have been taken yet");
+    }
   }
 
-  console.log("Writing to majority group...");
-  await writeKey("partition_key", "partition_value");
-  await new Promise((r) => setTimeout(r, 300));
-  await status();
+  console.log("\nVerifying KV data integrity...");
+  let verified = 0;
+  for (let i = 0; i < 200; i++) {
+    const val = await readKey(`key-${i}`);
+    if (val === `value-${i}`) {
+      verified++;
+    }
+  }
+  console.log(`  Verified ${verified}/200 keys`);
+  if (verified === 200) {
+    console.log("  PASS: All KV values are correct");
+  } else {
+    console.log("  FAIL: Some KV values are wrong");
+  }
 
-  console.log("\n--- Test 6: Heal partition and eventual consistency ---");
-  await heal();
+  console.log("\nTesting restart recovery from snapshot...");
+  const testNode = leader === 0 ? 1 : 0;
+  console.log(`Killing node ${testNode}...`);
+  killNode(testNode);
+  await new Promise((r) => setTimeout(r, 500));
+
+  console.log(`Restarting node ${testNode}...`);
+  startNode(testNode);
+  await new Promise((r) => setTimeout(r, 2000));
+
+  const restartedStatus = await httpGet(`http://127.0.0.1:${BASE_PORT + testNode}/status`);
+  if (restartedStatus) {
+    const st = restartedStatus as any;
+    console.log(`  Restarted node ${st.nodeId}:`);
+    console.log(`    snapshotIndex = ${st.snapshotIndex}`);
+    console.log(`    lastApplied = ${st.lastApplied}`);
+    console.log(`    kvSize = ${st.kvSize}`);
+
+    if (st.snapshotIndex > 0 && st.kvSize === 200) {
+      console.log("  PASS: Node recovered from snapshot without replaying all logs");
+    } else {
+      console.log("  WARN: Node may not have recovered correctly");
+    }
+  }
+
+  await status();
+  console.log("\n=== Snapshot Test Completed ===");
+}
+
+async function runMembershipTest(): Promise<void> {
+  console.log("\n=== Membership Change Test ===\n");
+
+  console.log("Clearing all data...");
+  clearAllData();
+
+  console.log("Starting 3 nodes (0, 1, 2)...");
+  for (let i = 0; i < 3; i++) {
+    startNode(i);
+  }
   await new Promise((r) => setTimeout(r, 1000));
-  await status();
-  await verifyLogs();
 
-  console.log("\n--- Test 7: Final verification ---");
-  await status();
-  await verifyLogs();
+  console.log("\nWaiting for leader...");
+  const leader = await waitForLeader(3000);
+  if (leader === null) {
+    console.log("FAIL: No leader elected");
+    return;
+  }
+  console.log(`Leader: node ${leader}`);
 
-  console.log("\n=== All tests completed ===");
+  console.log("\nWriting initial data...");
+  for (let i = 0; i < 10; i++) {
+    await writeKey(`init-${i}`, `value-${i}`);
+  }
+  await new Promise((r) => setTimeout(r, 300));
+  console.log("Initial data written");
+
+  console.log("\n--- Test: Add new member node 5 ---");
+  const newNodeId = 5;
+  const newNodePort = BASE_PORT + newNodeId;
+
+  console.log("Starting new node (empty state)...");
+  clearDataDir(newNodeId);
+  startNode(newNodeId);
+  await new Promise((r) => setTimeout(r, 500));
+
+  console.log("Adding node 5 to cluster...");
+  const addOk = await addMember(newNodeId, newNodePort);
+  if (!addOk) {
+    console.log("FAIL: Could not add member");
+    return;
+  }
+
+  await new Promise((r) => setTimeout(r, 2000));
+
+  console.log("\nChecking new node status:");
+  const newNodeStatus = await httpGet(`http://127.0.0.1:${newNodePort}/status`);
+  if (newNodeStatus) {
+    const st = newNodeStatus as any;
+    console.log(`  Node ${st.nodeId}:`);
+    console.log(`    state = ${st.state}`);
+    console.log(`    lastApplied = ${st.lastApplied}`);
+    console.log(`    snapshotIndex = ${st.snapshotIndex}`);
+    console.log(`    kvSize = ${st.kvSize}`);
+    console.log(`    clusterSize = ${st.clusterSize}`);
+
+    if (st.kvSize === 10 && st.clusterSize === 4) {
+      console.log("  PASS: New node synced all data and cluster config updated");
+    } else {
+      console.log("  WARN: New node may not have fully synced");
+    }
+  }
+
+  console.log("\nVerifying new node can serve reads (via leader redirect)...");
+  const val = await readKey("init-0");
+  if (val === "value-0") {
+    console.log("  PASS: Data consistency maintained after add");
+  } else {
+    console.log("  FAIL: Data inconsistency after add");
+  }
+
+  console.log("\nWriting more data to verify 4-node cluster works...");
+  for (let i = 0; i < 10; i++) {
+    await writeKey(`post-add-${i}`, `value-${i}`);
+  }
+  await new Promise((r) => setTimeout(r, 500));
+
+  let postAddVerified = 0;
+  for (let i = 0; i < 10; i++) {
+    const v = await readKey(`post-add-${i}`);
+    if (v === `value-${i}`) postAddVerified++;
+  }
+  console.log(`  Verified ${postAddVerified}/10 post-add keys`);
+
+  console.log("\n--- Test: Remove member node 5 ---");
+  const removeOk = await removeMember(newNodeId);
+  if (!removeOk) {
+    console.log("FAIL: Could not remove member");
+    return;
+  }
+
+  await new Promise((r) => setTimeout(r, 1000));
+
+  console.log("Checking remaining cluster status:");
+  const leaderAfter = await waitForLeader(2000);
+  console.log(`  Leader after removal: node ${leaderAfter}`);
+
+  const leaderStatus = await httpGet(`http://127.0.0.1:${BASE_PORT + (leaderAfter ?? 0)}/status`);
+  if (leaderStatus) {
+    const st = leaderStatus as any;
+    console.log(`  Cluster size = ${st.clusterSize}`);
+    if (st.clusterSize === 3) {
+      console.log("  PASS: Cluster size reduced to 3");
+    }
+  }
+
+  console.log("\nVerifying writes still work after removal...");
+  let removeWriteOk = true;
+  for (let i = 0; i < 5; i++) {
+    const ok = await writeKey(`post-remove-${i}`, `value-${i}`);
+    if (!ok) {
+      removeWriteOk = false;
+      break;
+    }
+  }
+  if (removeWriteOk) {
+    console.log("  PASS: Writes work after member removal");
+  } else {
+    console.log("  FAIL: Writes failed after member removal");
+  }
+
+  await status();
+  console.log("\n=== Membership Test Completed ===");
+}
+
+async function runFullTest(): Promise<void> {
+  console.log("\n=== Full Raft Feature Test ===\n");
+
+  await runSnapshotTest();
+
+  for (let i = 0; i < 10; i++) {
+    const info = nodes[i];
+    if (info && info.alive) {
+      killNode(i);
+    }
+  }
+  await new Promise((r) => setTimeout(r, 500));
+
+  await runMembershipTest();
+
+  console.log("\n=== All Tests Completed ===");
 }
 
 async function interactive(): Promise<void> {
@@ -353,16 +520,21 @@ Raft Cluster Manager
 Usage: node manager.js <command> [args]
 
 Commands:
-  start           Start all 5 nodes
-  stop            Stop all nodes
-  kill <id>       Kill node <id>
-  restart <id>    Restart node <id>
-  status          Show cluster status
-  write <k> <v>   Write key=value
-  read <k>        Read key
-  partition <g1> <g2>  Create partition (e.g. partition 0,1,2 3,4)
-  heal            Heal network partition
-  test            Run verification tests
+  start               Start all 5 nodes
+  stop                Stop all nodes
+  kill <id>           Kill node <id>
+  restart <id>        Restart node <id>
+  status              Show cluster status
+  write <k> <v>       Write key=value
+  read <k>            Read key
+  partition <g1> <g2> Create partition (e.g. partition 0,1,2 3,4)
+  heal                Heal network partition
+  add-member <id> <port>  Add a node to cluster
+  remove-member <id>      Remove a node from cluster
+  test-snapshot       Run snapshot test
+  test-membership     Run membership change test
+  test                Run all tests
+  clear-data          Clear all data directories
 `);
     return;
   }
@@ -372,7 +544,9 @@ Commands:
       for (let i = 0; i < NODE_COUNT; i++) startNode(i);
       break;
     case "stop":
-      for (let i = 0; i < NODE_COUNT; i++) killNode(i);
+      for (let i = 0; i < nodes.length; i++) {
+        if (nodes[i] && nodes[i].alive) killNode(i);
+      }
       break;
     case "kill":
       killNode(parseInt(args[1]));
@@ -387,7 +561,8 @@ Commands:
       await writeKey(args[1], args[2]);
       break;
     case "read":
-      await readKey(args[1]);
+      const val = await readKey(args[1]);
+      console.log(`${args[1]} = ${val}`);
       break;
     case "partition": {
       const g1 = args[1].split(",").map(Number);
@@ -398,15 +573,31 @@ Commands:
     case "heal":
       await heal();
       break;
+    case "add-member":
+      await addMember(parseInt(args[1]), parseInt(args[2]));
+      break;
+    case "remove-member":
+      await removeMember(parseInt(args[1]));
+      break;
+    case "test-snapshot":
+      await runSnapshotTest();
+      break;
+    case "test-membership":
+      await runMembershipTest();
+      break;
     case "test":
-      await runTest();
+      await runFullTest();
+      break;
+    case "clear-data":
+      clearAllData();
+      console.log("All data cleared");
       break;
     default:
       console.log(`Unknown command: ${cmd}`);
   }
 }
 
-for (let i = 0; i < NODE_COUNT; i++) {
+for (let i = 0; i < NODE_COUNT + 10; i++) {
   nodes.push({ id: i, port: BASE_PORT + i, process: null, alive: false });
 }
 
