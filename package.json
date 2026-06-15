@@ -1,0 +1,16 @@
+{
+  "name": "raft-cluster",
+  "version": "1.0.0",
+  "description": "5-node Raft consensus cluster with KV store",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "manager": "node dist/manager.js"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "typescript": "^5.3.3",
+    "@types/node": "^20.11.0"
+  }
+}
